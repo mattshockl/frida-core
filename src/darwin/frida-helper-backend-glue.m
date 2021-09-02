@@ -505,6 +505,115 @@ extern int sandbox_check (pid_t pid, const char * operation, FridaSandboxFilterT
 
 extern FridaSandboxFilterType SANDBOX_CHECK_NO_REPORT;
 
+gchar *
+_frida_darwin_helper_backend_make_pipe_endpoint_service (FridaDarwinHelperBackend * self, mach_port_t remote_wrapper, guint remote_pid, guint remote_task,
+    GError ** error)
+{
+  gchar * remote_address = NULL;
+  FridaHelperContext * ctx = self->context;
+  gboolean allowed_by_sandbox;
+  char * token = NULL;
+  const gchar * uuid;
+
+  allowed_by_sandbox =
+      sandbox_check (remote_pid, "mach-lookup", FRIDA_SANDBOX_FILTER_GLOBAL_NAME | SANDBOX_CHECK_NO_REPORT, ctx->piped_name) == 0;
+  if (!allowed_by_sandbox)
+  {
+    static gsize apis_initialized = 0;
+    static char * (* sandbox_extension_issue_mach_to_process_by_pid) (const char * extension_class, const char * name, uint32_t flags, pid_t pid);
+    static char * (* sandbox_extension_issue_mach) (const char * extension_class, const char * name, int reserved, uint32_t flags);
+
+    if (g_once_init_enter (&apis_initialized))
+    {
+      void * sandbox;
+
+      sandbox = dlopen ("/usr/lib/system/libsystem_sandbox.dylib", RTLD_GLOBAL | RTLD_LAZY);
+
+      sandbox_extension_issue_mach_to_process_by_pid = dlsym (sandbox, "sandbox_extension_issue_mach_to_process_by_pid");
+      if (sandbox_extension_issue_mach_to_process_by_pid == NULL)
+        sandbox_extension_issue_mach = dlsym (sandbox, "sandbox_extension_issue_mach");
+
+      g_once_init_leave (&apis_initialized, TRUE);
+    }
+
+    if (sandbox_extension_issue_mach_to_process_by_pid != NULL)
+      token = sandbox_extension_issue_mach_to_process_by_pid (FRIDA_MACH_LOOKUP_EXCEPTION, ctx->piped_name, 0, remote_pid);
+    else
+      token = sandbox_extension_issue_mach (FRIDA_MACH_LOOKUP_EXCEPTION, ctx->piped_name, 0, 0);
+  }
+
+  frida_darwin_helper_backend_stash_pipe_fileport (self, &remote_wrapper, &uuid);
+
+  if (token != NULL)
+    remote_address = g_strdup_printf ("service=%s,uuid=%s,token=%s", ctx->piped_name, uuid, token);
+  else
+    remote_address = g_strdup_printf ("service=%s,uuid=%s", ctx->piped_name, uuid);
+
+  free (token);
+
+  return remote_address;
+}
+
+gchar *
+_frida_darwin_helper_backend_make_pipe_endpoint_port (FridaDarwinHelperBackend * self, mach_port_t remote_wrapper, guint remote_pid, guint remote_task,
+    GError ** error)
+{
+  kern_return_t kr;
+  gchar * remote_address = NULL;
+  mach_port_t self_task;
+  mach_port_t remote_rx = MACH_PORT_NULL;
+  mach_port_t remote_tx = MACH_PORT_NULL;
+  mach_msg_type_name_t acquired_type;
+  mach_msg_header_t init;
+  const gchar * failed_operation;
+
+  self_task = mach_task_self ();
+
+  kr = mach_port_allocate (remote_task, MACH_PORT_RIGHT_RECEIVE, &remote_rx);
+  CHECK_MACH_RESULT (kr, ==, KERN_SUCCESS, "mach_port_allocate remote_rx");
+
+  kr = mach_port_extract_right (remote_task, remote_rx, MACH_MSG_TYPE_MAKE_SEND, &remote_tx, &acquired_type);
+  CHECK_MACH_RESULT (kr, ==, KERN_SUCCESS, "mach_port_extract_right remote_rx");
+
+  init.msgh_size = sizeof (init);
+  init.msgh_reserved = 0;
+  init.msgh_id = 3;
+
+  init.msgh_bits = MACH_MSGH_BITS (MACH_MSG_TYPE_MOVE_SEND, MACH_MSG_TYPE_MOVE_SEND);
+  init.msgh_remote_port = remote_tx;
+  init.msgh_local_port = remote_wrapper;
+  kr = mach_msg_send (&init);
+  CHECK_MACH_RESULT (kr, ==, KERN_SUCCESS, "mach_msg_send remote_tx");
+  
+  remote_address = g_strdup_printf ("port=0x%x", remote_rx);
+
+  remote_tx = MACH_PORT_NULL;
+  remote_rx = MACH_PORT_NULL;
+
+  goto beach;
+
+mach_failure:
+  {
+    printf("bad: %s\n\n\n", mach_error_string (kr));
+    g_set_error (error,
+        FRIDA_ERROR,
+        FRIDA_ERROR_NOT_SUPPORTED,
+        "Unexpected error while preparing pipe endpoints for process with pid %u (%s returned '%s')",
+        remote_pid, failed_operation, mach_error_string (kr));
+    goto beach;
+  }
+beach:
+  {
+    if (remote_tx != MACH_PORT_NULL)
+      mach_port_deallocate (self_task, remote_tx);
+
+    if (remote_rx != MACH_PORT_NULL)
+      mach_port_mod_refs (remote_task, remote_rx, MACH_PORT_RIGHT_RECEIVE, -1);
+
+    return remote_address;
+  }
+}
+
 void
 frida_darwin_helper_backend_make_pipe_endpoints (FridaDarwinHelperBackend * self, guint local_task, guint remote_pid, guint remote_task,
     FridaPipeEndpoints * result, GError ** error)
@@ -516,11 +625,9 @@ frida_darwin_helper_backend_make_pipe_endpoints (FridaDarwinHelperBackend * self
   mach_port_t remote_wrapper = MACH_PORT_NULL;
   mach_port_t local_rx = MACH_PORT_NULL;
   mach_port_t local_tx = MACH_PORT_NULL;
-  mach_port_t remote_rx = MACH_PORT_NULL;
-  mach_port_t remote_tx = MACH_PORT_NULL;
   mach_msg_type_name_t acquired_type;
   mach_msg_header_t init;
-  gchar * local_address, * remote_address;
+  gchar * local_address, * remote_address, * _remote_address;
   kern_return_t kr;
   const gchar * failed_operation;
 
@@ -574,70 +681,40 @@ frida_darwin_helper_backend_make_pipe_endpoints (FridaDarwinHelperBackend * self
   local_wrapper = MACH_PORT_NULL;
 
   local_address = g_strdup_printf ("pipe:port=0x%x", local_rx);
+  remote_address = NULL;
 
   if (ctx->piped_name != NULL)
+    remote_address = _frida_darwin_helper_backend_make_pipe_endpoint_service (self, remote_wrapper, remote_pid, remote_task, error);
+
+  gchar * port_address = _frida_darwin_helper_backend_make_pipe_endpoint_port (self, remote_wrapper, remote_pid, remote_task, error);
+  if (port_address != NULL)
   {
-    gboolean allowed_by_sandbox;
-    char * token = NULL;
-    const gchar * uuid;
-
-    allowed_by_sandbox =
-        sandbox_check (remote_pid, "mach-lookup", FRIDA_SANDBOX_FILTER_GLOBAL_NAME | SANDBOX_CHECK_NO_REPORT, ctx->piped_name) == 0;
-    if (!allowed_by_sandbox)
-    {
-      static gsize apis_initialized = 0;
-      static char * (* sandbox_extension_issue_mach_to_process_by_pid) (const char * extension_class, const char * name, uint32_t flags, pid_t pid);
-      static char * (* sandbox_extension_issue_mach) (const char * extension_class, const char * name, int reserved, uint32_t flags);
-
-      if (g_once_init_enter (&apis_initialized))
-      {
-        void * sandbox;
-
-        sandbox = dlopen ("/usr/lib/system/libsystem_sandbox.dylib", RTLD_GLOBAL | RTLD_LAZY);
-
-        sandbox_extension_issue_mach_to_process_by_pid = dlsym (sandbox, "sandbox_extension_issue_mach_to_process_by_pid");
-        if (sandbox_extension_issue_mach_to_process_by_pid == NULL)
-          sandbox_extension_issue_mach = dlsym (sandbox, "sandbox_extension_issue_mach");
-
-        g_once_init_leave (&apis_initialized, TRUE);
-      }
-
-      if (sandbox_extension_issue_mach_to_process_by_pid != NULL)
-        token = sandbox_extension_issue_mach_to_process_by_pid (FRIDA_MACH_LOOKUP_EXCEPTION, ctx->piped_name, 0, remote_pid);
-      else
-        token = sandbox_extension_issue_mach (FRIDA_MACH_LOOKUP_EXCEPTION, ctx->piped_name, 0, 0);
-    }
-
-    frida_darwin_helper_backend_stash_pipe_fileport (self, &remote_wrapper, &uuid);
-
-    if (token != NULL)
-      remote_address = g_strdup_printf ("pipe:service=%s,uuid=%s,token=%s", ctx->piped_name, uuid, token);
+    if (remote_address == NULL)
+      remote_address = port_address;
     else
-      remote_address = g_strdup_printf ("pipe:service=%s,uuid=%s", ctx->piped_name, uuid);
-
-    free (token);
+    {
+      _remote_address = g_strconcat (remote_address, ",", port_address, NULL);
+      g_free(remote_address);
+      g_free(port_address);
+      remote_address = _remote_address;
+    }
   }
-  else
-  {
-    kr = mach_port_allocate (remote_task, MACH_PORT_RIGHT_RECEIVE, &remote_rx);
-    CHECK_MACH_RESULT (kr, ==, KERN_SUCCESS, "mach_port_allocate remote_rx");
 
-    kr = mach_port_extract_right (remote_task, remote_rx, MACH_MSG_TYPE_MAKE_SEND, &remote_tx, &acquired_type);
-    CHECK_MACH_RESULT (kr, ==, KERN_SUCCESS, "mach_port_extract_right remote_rx");
+  // if remote_address is NULL here, both attempts failed so we're going to give up
+  if (remote_address == NULL)
+    goto beach;
 
-    init.msgh_bits = MACH_MSGH_BITS (MACH_MSG_TYPE_MOVE_SEND, MACH_MSG_TYPE_MOVE_SEND);
-    init.msgh_remote_port = remote_tx;
-    init.msgh_local_port = remote_wrapper;
-    kr = mach_msg_send (&init);
-    CHECK_MACH_RESULT (kr, ==, KERN_SUCCESS, "mach_msg_send remote_tx");
-    remote_tx = MACH_PORT_NULL;
-    remote_wrapper = MACH_PORT_NULL;
+  _remote_address = g_strdup_printf ("pipe:%s", remote_address);
+  g_free(remote_address);
+  remote_address = _remote_address;
 
-    remote_address = g_strdup_printf ("pipe:port=0x%x", remote_rx);
-  }
+  // clear error if we ultimately succeeded
+  g_clear_error(error);
+
+  printf("It worked: %s\n\n\n", remote_address);
 
   local_rx = MACH_PORT_NULL;
-  remote_rx = MACH_PORT_NULL;
+  remote_wrapper = MACH_PORT_NULL;
 
   frida_pipe_endpoints_init (result, local_address, remote_address);
 
@@ -668,20 +745,17 @@ beach:
   {
     guint i;
 
-    if (remote_tx != MACH_PORT_NULL)
-      mach_port_deallocate (self_task, remote_tx);
     if (local_tx != MACH_PORT_NULL)
       mach_port_deallocate (self_task, local_tx);
 
-    if (remote_rx != MACH_PORT_NULL)
-      mach_port_mod_refs (remote_task, remote_rx, MACH_PORT_RIGHT_RECEIVE, -1);
     if (local_rx != MACH_PORT_NULL)
       mach_port_mod_refs (local_task, local_rx, MACH_PORT_RIGHT_RECEIVE, -1);
 
-    if (remote_wrapper != MACH_PORT_NULL)
-      mach_port_deallocate (self_task, remote_wrapper);
     if (local_wrapper != MACH_PORT_NULL)
       mach_port_deallocate (self_task, local_wrapper);
+  
+    if (remote_wrapper != MACH_PORT_NULL)
+      mach_port_deallocate (self_task, remote_wrapper);
 
     for (i = 0; i != G_N_ELEMENTS (sockets); i++)
     {
