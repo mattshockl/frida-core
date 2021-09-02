@@ -122,9 +122,10 @@ namespace Frida {
 #if DARWIN
 			try {
 				int fd = -1;
-				uint port;
+				int port_int = -1;
+				GLib.Error cached_error = null;
 				MatchInfo info;
-				if (address.scanf ("pipe:port=0x%x", out port) == 1) {
+				/*if (address.scanf ("pipe:port=0x%x", out port) == 1) {
 					fd = _consume_stashed_file_descriptor (port);
 				} else if (/^pipe:service=(.+?),uuid=(.+?)(,token=(.+))?$/.match (address, 0, out info)) {
 					string service = info.fetch (1);
@@ -134,6 +135,41 @@ namespace Frida {
 						token = info.fetch (4);
 
 					fd = _fetch_file_descriptor_from_service (service, uuid, token);
+				}*/
+				
+				
+				if (/^pipe:(service=([^,]+),uuid=([^,]+)(,token=([^,]+))?)?,?(port=([^,]+))?$/.match (address, 0, out info)) {
+					string? service = info.fetch (2);
+					string? uuid = info.fetch (3);
+					string? token = info.fetch (5);
+					string? port = info.fetch (7);
+
+					if (service.length > 0 && uuid.length > 0) {
+						if (token.length == 0)
+							token = null;
+						
+						try {
+							GLib.info("1\n");
+							fd = _fetch_file_descriptor_from_service (service, uuid, token);
+						} catch (GLib.Error e) {
+							cached_error = e;
+						}
+					}
+
+					// fetching from service failed, let's try port
+					if (fd == -1 && port.scanf ("0x%x", out port_int) == 1) {
+						try {
+							GLib.info("2 %d\n", port_int);
+							fd = _consume_stashed_file_descriptor (port_int);
+						} catch (GLib.Error e) {
+							cached_error = e;
+						}
+					}
+					
+					if (fd == -1 && cached_error != null) {
+						GLib.info("3\n");
+						throw cached_error;
+					}
 				}
 
 				if (fd != -1) {
@@ -215,3 +251,4 @@ namespace Frida {
 	}
 #endif
 }
+
